@@ -4,21 +4,15 @@
 #include <QMainWindow>
 #include <QTcpServer>
 #include <QTcpSocket>
+#include <QHash>
+#include <QImage>
+#include <QListWidgetItem>
 #include <QLabel>
 #include <QVBoxLayout>
-#include <QListWidgetItem>
-#include <QImage>
-#include <QDir>
-#include <QFile>
-#include <QTextStream>
-#include <QTime>
-#include <QDebug>
-#include <QTimer>
-#include <random>
 
-QT_BEGIN_NAMESPACE
-namespace Ui { class MainWindow; }
-QT_END_NAMESPACE
+namespace Ui {
+class MainWindow;
+}
 
 class MainWindow : public QMainWindow
 {
@@ -34,15 +28,17 @@ private slots:
     void onReadyRead();
     void onClientConnected();
     void onClientDisconnected();
+    void onSocketDisconnected();
 
 private:
     Ui::MainWindow *ui;
     int userId;
     QTcpServer *server;
     QTcpSocket *clientSocket;
-    QTcpSocket *incomingSocket;
+    QHash<QTcpSocket*, quint32> socketBlockSizes;
 
-    const QString chatFile = "/home/astra/untitled/chat.txt";
+    const QString chatHistory1 = "/home/astra/untitled/chat_history_user1.txt";
+    const QString chatHistory2 = "/home/astra/untitled/chat_history_user2.txt";
     const QString imagesDir = "/home/astra/untitled/images";
     const QString encodedImagesDir = "/home/astra/untitled/encoded_images";
 
@@ -54,8 +50,10 @@ private:
 
     void initWorkspace();
     void saveToHistory(const QString &message);
-    void addMessageToChat(const QString &message);
+    void loadHistory();
+    void addMessageToChat(const QString &message, bool isMyMessage);
     QString getCurrentTime() const;
+    QString getChatHistoryFile() const;
 };
 
 #endif // MAINWINDOW_H

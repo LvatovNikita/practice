@@ -3,20 +3,25 @@
 #include <QFileInfo>
 #include <QRandomGenerator>
 #include <QDateTime>
+#include <QMessageBox>
+#include <QDir>
+#include <QDataStream>
+#include <QScrollBar>
+#include <QHBoxLayout>
 
 MainWindow::MainWindow(int userId, QWidget *parent)
     : QMainWindow(parent), ui(new Ui::MainWindow), userId(userId)
 {
     ui->setupUi(this);
     initWorkspace();
+    loadHistory();
 
     server = new QTcpServer(this);
     int port = (userId == 1) ? 12345 : 54321;
     if (!server->listen(QHostAddress::Any, port)) {
-        qDebug() << "Server could not start!";
-    } else {
-        qDebug() << "Server started on port" << port;
+        QMessageBox::critical(this, "Ошибка", QString("Не удалось запустить сервер на порту %1").arg(port));
     }
+
     connect(server, &QTcpServer::newConnection, this, &MainWindow::onNewConnection);
 
     clientSocket = new QTcpSocket(this);
@@ -30,49 +35,109 @@ MainWindow::MainWindow(int userId, QWidget *parent)
 
 MainWindow::~MainWindow()
 {
+    if (server) {
+        server->close();
+        delete server;
+    }
+
+    if (clientSocket) {
+        clientSocket->disconnectFromHost();
+        if (clientSocket->state() != QAbstractSocket::UnconnectedState) {
+            clientSocket->waitForDisconnected();
+        }
+        delete clientSocket;
+    }
+
+    for (QTcpSocket* socket : socketBlockSizes.keys()) {
+        socket->disconnectFromHost();
+        socket->deleteLater();
+    }
+
     delete ui;
-    if (server) server->close();
-    if (clientSocket) clientSocket->close();
-    if (incomingSocket) incomingSocket->close();
 }
 
+QString MainWindow::getChatHistoryFile() const
+{
+    return userId == 1 ? chatHistory1 : chatHistory2;
+}
+
+void MainWindow::initWorkspace()
+{
+    QDir().mkpath(imagesDir);
+    QDir().mkpath(encodedImagesDir);
+
+    QString historyFile = getChatHistoryFile();
+    if (!QFile::exists(historyFile)) {
+        QFile file(historyFile);
+        file.open(QIODevice::WriteOnly);
+        file.close();
+    }
+}
+
+void MainWindow::loadHistory()
+{
+    QFile file(getChatHistoryFile());
+    if (file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        QTextStream in(&file);
+        while (!in.atEnd()) {
+            QString line = in.readLine();
+            if (line.contains("|||")) {
+                QStringList parts = line.split("|||");
+                if (parts.size() >= 2) {
+                    bool isMyMessage = parts[0].contains("Я:");
+                    QString messageText = parts[0].replace("Я:", "").replace("Собеседник:", "").trimmed();
+                    addMessageToChat(messageText, isMyMessage);
+                }
+            }
+        }
+        file.close();
+    }
+}
 
 void MainWindow::onNewConnection()
 {
-    incomingSocket = server->nextPendingConnection();
-    connect(incomingSocket, &QTcpSocket::readyRead, this, &MainWindow::onReadyRead);
-    connect(incomingSocket, &QTcpSocket::disconnected, incomingSocket, &QTcpSocket::deleteLater);
-    qDebug() << "New connection from" << incomingSocket->peerAddress().toString();
+    QTcpSocket *socket = server->nextPendingConnection();
+    connect(socket, &QTcpSocket::readyRead, this, &MainWindow::onReadyRead);
+    connect(socket, &QTcpSocket::disconnected, this, &MainWindow::onSocketDisconnected);
+    socketBlockSizes[socket] = 0;
 }
 
-void MainWindow::onReadyRead() {
-    QDataStream in(incomingSocket);
+void MainWindow::onReadyRead()
+{
+    QTcpSocket *socket = qobject_cast<QTcpSocket*>(sender());
+    if (!socket || !socketBlockSizes.contains(socket)) return;
+
+    QDataStream in(socket);
     in.setVersion(QDataStream::Qt_5_15);
 
-    static quint32 blockSize = 0;
-    if (blockSize == 0) {
-        if (incomingSocket->bytesAvailable() < sizeof(quint32))
+    quint32 &blockSize = socketBlockSizes[socket];
+
+    while (socket->bytesAvailable() > 0) {
+        if (blockSize == 0) {
+            if (socket->bytesAvailable() < sizeof(quint32))
+                return;
+            in >> blockSize;
+        }
+
+        if (socket->bytesAvailable() < blockSize)
             return;
-        in >> blockSize;
-    }
 
-    if (incomingSocket->bytesAvailable() < blockSize)
-        return;
+        QByteArray imageData;
+        in >> imageData;
+        blockSize = 0;
 
-    QByteArray imageData;
-    in >> imageData;
-    blockSize = 0;
+        QString tempImagePath = encodedImagesDir + "/received_" +
+                              QString::number(QDateTime::currentSecsSinceEpoch()) + ".png";
+        QFile file(tempImagePath);
+        if (file.open(QIODevice::WriteOnly)) {
+            file.write(imageData);
+            file.close();
 
-    QString tempImagePath = encodedImagesDir + "/received_" +
-                          QString::number(QDateTime::currentSecsSinceEpoch()) + ".png";
-    QFile file(tempImagePath);
-    if (file.open(QIODevice::WriteOnly)) {
-        file.write(imageData);
-        file.close();
-
-        QString decodedMessage = decodeMessage(tempImagePath);
-        if (!decodedMessage.isEmpty()) {
-            addMessageToChat("Собеседник: " + decodedMessage);
+            QString decodedMessage = decodeMessage(tempImagePath);
+            if (!decodedMessage.isEmpty()) {
+                addMessageToChat(decodedMessage, false);
+                saveToHistory("Собеседник: " + decodedMessage + " ||| " + getCurrentTime());
+            }
         }
     }
 }
@@ -87,6 +152,14 @@ void MainWindow::onClientDisconnected()
     qDebug() << "Disconnected from server!";
 }
 
+void MainWindow::onSocketDisconnected()
+{
+    QTcpSocket *socket = qobject_cast<QTcpSocket*>(sender());
+    if (socket) {
+        socketBlockSizes.remove(socket);
+        socket->deleteLater();
+    }
+}
 
 bool MainWindow::encodeMessage(const QString &message, QString &outputPath)
 {
@@ -211,20 +284,78 @@ QString MainWindow::getRandomImage() const
     return dir.filePath(images[QRandomGenerator::global()->bounded(images.size())]);
 }
 
+void MainWindow::addMessageToChat(const QString &message, bool isMyMessage)
+{
+    QWidget *messageWidget = new QWidget();
+    QHBoxLayout *outerLayout = new QHBoxLayout(messageWidget);
+    outerLayout->setContentsMargins(5, 2, 5, 2);
 
-void MainWindow::on_pushButton_clicked() {
+    QWidget *contentWidget = new QWidget();
+    QVBoxLayout *innerLayout = new QVBoxLayout(contentWidget);
+    innerLayout->setContentsMargins(0, 0, 0, 0);
+    innerLayout->setSpacing(2);
+
+    QLabel *textLabel = new QLabel(message);
+    textLabel->setWordWrap(true);
+    textLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    textLabel->setAlignment(Qt::AlignLeft | Qt::AlignTop);
+    textLabel->setMaximumWidth(ui->listWidget->width() * 0.7);
+    textLabel->setStyleSheet(
+        isMyMessage
+        ? "QLabel { background: #DCF8C6; border-radius: 10px; padding: 8px; margin-right: 5px; }"
+        : "QLabel { background: #E1F3FB; border-radius: 10px; padding: 8px; margin-left: 5px; }"
+    );
+
+    QLabel *timeLabel = new QLabel(getCurrentTime() + (isMyMessage ? " • Вы" : " • Собеседник"));
+    timeLabel->setStyleSheet("color: #777777; font-size: 9px;");
+    timeLabel->setAlignment(isMyMessage ? Qt::AlignRight : Qt::AlignLeft);
+
+    innerLayout->addWidget(textLabel);
+    innerLayout->addWidget(timeLabel);
+
+    if (isMyMessage) {
+        outerLayout->addStretch();
+        outerLayout->addWidget(contentWidget);
+    } else {
+        outerLayout->addWidget(contentWidget);
+        outerLayout->addStretch();
+    }
+
+    QListWidgetItem *item = new QListWidgetItem(ui->listWidget);
+    item->setSizeHint(contentWidget->sizeHint());
+    ui->listWidget->setItemWidget(item, messageWidget);
+    ui->listWidget->scrollToBottom();
+}
+
+void MainWindow::saveToHistory(const QString &message)
+{
+    QFile file(getChatHistoryFile());
+    if (file.open(QIODevice::Append | QIODevice::Text)) {
+        QTextStream out(&file);
+        out << message << "\n";
+        file.close();
+    }
+}
+
+QString MainWindow::getCurrentTime() const
+{
+    return QTime::currentTime().toString("hh:mm");
+}
+
+void MainWindow::on_pushButton_clicked()
+{
     QString message = ui->lineEdit->text().trimmed();
     if (message.isEmpty()) return;
 
     QString imagePath;
     if (!encodeMessage(message, imagePath)) {
-        qDebug() << "Encoding failed";
+        QMessageBox::warning(this, "Ошибка", "Не удалось закодировать сообщение");
         return;
     }
 
     QFile file(imagePath);
     if (!file.open(QIODevice::ReadOnly)) {
-        qDebug() << "Cannot open image file";
+        QMessageBox::warning(this, "Ошибка", "Не удалось открыть файл изображения");
         return;
     }
     QByteArray imageData = file.readAll();
@@ -234,7 +365,7 @@ void MainWindow::on_pushButton_clicked() {
     clientSocket->connectToHost("127.0.0.1", targetPort);
 
     if (!clientSocket->waitForConnected(1000)) {
-        qDebug() << "Connection failed!";
+        QMessageBox::warning(this, "Ошибка", "Не удалось подключиться к собеседнику");
         return;
     }
 
@@ -248,110 +379,7 @@ void MainWindow::on_pushButton_clicked() {
     clientSocket->flush();
     clientSocket->disconnectFromHost();
 
-    addMessageToChat("Я: " + message);
+    addMessageToChat(message, true);
+    saveToHistory("Я: " + message + " ||| " + getCurrentTime());
     ui->lineEdit->clear();
-}
-
-void MainWindow::addMessageToChat(const QString &message) {
-    QString messageText = message;
-    messageText.remove("Я: ").remove("Собеседник: ");
-
-    QWidget *messageWidget = new QWidget(ui->listWidget);
-    QHBoxLayout *outerLayout = new QHBoxLayout(messageWidget);
-    outerLayout->setContentsMargins(2, 5, 2, 5);
-    QWidget *contentWidget = new QWidget();
-    QVBoxLayout *innerLayout = new QVBoxLayout(contentWidget);
-    innerLayout->setContentsMargins(0, 0, 0, 0);
-    innerLayout->setSpacing(2);
-
-    QLabel *textLabel = new QLabel(messageText);
-    textLabel->setWordWrap(true);
-    textLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
-
-    QFontMetrics fm(textLabel->font());
-    int textWidth = fm.horizontalAdvance(messageText);
-    int maxWidth = ui->listWidget->width() * 0.7;
-    int minWidth = ui->listWidget->width() * 0.10;
-    int optimalWidth = qBound(minWidth, textWidth + 20, maxWidth);
-
-    textLabel->setMinimumWidth(minWidth);
-    textLabel->setMaximumWidth(maxWidth);
-    textLabel->setFixedWidth(optimalWidth);
-
-    textLabel->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::MinimumExpanding);
-
-    textLabel->setStyleSheet(
-        message.startsWith("Я: ")
-            ? "QLabel {"
-              "background: #DCF8C6;"
-              "border-radius: 10px;"
-              "padding: 8px;"
-              "min-height: 20px;"
-              "}"
-            : "QLabel {"
-              "background: #E1F3FB;"
-              "border-radius: 10px;"
-              "padding: 8px;"
-              "min-height: 20px;"
-              "}"
-    );
-
-    QLabel *timeLabel = new QLabel(
-        message.startsWith("Я: ")
-            ? QString("%1 • Вы").arg(getCurrentTime())
-            : QString("%1 • Собеседник").arg(getCurrentTime())
-    );
-    timeLabel->setStyleSheet("color: #777777; font-size: 9px; margin-top: 2px;");
-    timeLabel->setAlignment(
-        message.startsWith("Я: ") ? Qt::AlignRight : Qt::AlignLeft
-    );
-
-    innerLayout->addWidget(textLabel);
-    innerLayout->addWidget(timeLabel);
-
-    if (message.startsWith("Я: ")) {
-        outerLayout->addStretch();
-        outerLayout->addWidget(contentWidget);
-    } else {
-        outerLayout->addWidget(contentWidget);
-        outerLayout->addStretch();
-    }
-
-    textLabel->adjustSize();
-    contentWidget->adjustSize();
-    messageWidget->adjustSize();
-
-    QListWidgetItem *item = new QListWidgetItem(ui->listWidget);
-    item->setSizeHint(contentWidget->sizeHint());
-    ui->listWidget->setItemWidget(item, messageWidget);
-
-    ui->listWidget->scrollToBottom();
-}
-
-void MainWindow::saveToHistory(const QString &message)
-{
-    QFile file(chatFile);
-    if (file.open(QIODevice::Append | QIODevice::Text)) {
-        QTextStream out(&file);
-        out << "user|||" << message << "|||" << getCurrentTime() << "\n";
-        file.close();
-    }
-}
-
-QString MainWindow::getCurrentTime() const
-{
-    return QTime::currentTime().toString("hh:mm");
-}
-
-void MainWindow::initWorkspace()
-{
-    QDir().mkpath(imagesDir);
-    QDir().mkpath(encodedImagesDir);
-
-    if (!QFile::exists(chatFile)) {
-        QFile file(chatFile);
-        if (file.open(QIODevice::WriteOnly)) {
-            file.close();
-        }
-    }
 }
